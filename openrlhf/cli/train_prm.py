@@ -32,6 +32,29 @@ def train(args):
     )
     # configure tokenizer
     tokenizer = get_tokenizer(args.pretrain, model.model, "right", strategy, use_fast=not args.disable_fast_tokenizer)
+    if args.specialize_reward_tokens:
+        additional_special_tokens = [
+            args.placeholder_token_in_tokenizer,
+            *args.reward_tokens_in_tokenizer,
+        ]
+        old_vocab_size = len(tokenizer)
+        tokenizer.add_special_tokens({"additional_special_tokens": additional_special_tokens})
+        new_vocab_size = len(tokenizer)
+        assert new_vocab_size == old_vocab_size, (
+            f"placeholder token {repr(args.placeholder_token_in_tokenizer)} does not exist in tokenizer.\n"
+            "Please consider to choose reserved trained tokens as placeholder/rewards tokens. "
+            "Or please disable --specialize_reward_tokens option."
+        )
+        strategy.print((
+            f"placeholder token {repr(args.placeholder_token_in_tokenizer)} "
+            f"and reward tokens {repr(args.reward_tokens_in_tokenizer)} "
+            "are added to tokenizer as additional_special_tokens"
+        ))
+        for token in additional_special_tokens:
+            strategy.print((
+                f"{repr(token)} -> {tokenizer(token)['input_ids']}, "
+                f"{repr(' '+ token)} -> {tokenizer(' ' + token)['input_ids']}"
+            ))
     strategy.print(model)
 
     # gradient_checkpointing
@@ -55,6 +78,40 @@ def train(args):
     )
     train_data = train_data.select(range(min(args.max_samples, len(train_data))))
     eval_data = eval_data.select(range(min(args.max_samples, len(eval_data))))
+
+    def preprocessing(sample):
+        # placeholder token is replaced to reserved token in tokenizer to avoid tokenization issue.
+        # see https://github.com/OpenRLHF/OpenRLHF/issues/645
+        if args.input_key in sample and args.placeholder_token != args.placeholder_token_in_tokenizer:
+            sample[args.input_key] = sample[args.input_key].replace(
+                args.placeholder_token,
+                args.placeholder_token_in_tokenizer
+            )
+        if args.label_key in sample and args.reward_tokens != args.reward_tokens_in_tokenizer:
+            label_list = sample[args.label_key]
+            if label_list is not None and len(label_list) > 0 and isinstance(label_list[0], str):
+                new_label_list = []
+                for label in label_list:
+                    for reward_token, reward_token_in_tokenizer in zip(args.reward_tokens, args.reward_tokens_in_tokenizer):
+                        label = label.replace(reward_token, reward_token_in_tokenizer)
+                        new_label_list.append(label)
+                sample[args.label_key] = label_list
+        return sample
+
+    train_data = train_data.map(preprocessing)
+    eval_data = eval_data.map(preprocessing)
+
+    def print_sample(sample) -> None:
+        input_text = sample[args.input_key]
+        labels = sample[args.label_key]
+        strategy.print("inputs:\n{}".format(tokenizer.decode(tokenizer.encode(input_text), skip_special_tokens=False)))
+        strategy.print("input_ids:\n{}".format(tokenizer.encode(input_text)))
+        strategy.print("labels:\n{}".format(labels))
+        if isinstance(labels[0], str):
+            strategy.print("label_ids:\n{}".format([tokenizer.encode(i, add_special_tokens=False)[-1] for i in labels]))
+
+    print_sample(train_data[0])
+
     train_dataset = ProcessRewardDataset(train_data, tokenizer, args.max_len, strategy)
     eval_dataset = ProcessRewardDataset(eval_data, tokenizer, args.max_len, strategy)
 
@@ -163,8 +220,13 @@ if __name__ == "__main__":
     parser.add_argument("--lr_scheduler", type=str, default="cosine_with_min_lr")
     parser.add_argument("--l2", type=float, default=0.0, help="weight decay loss")
     parser.add_argument("--adam_betas", type=float, nargs=2, default=(0.9, 0.95), help="Betas for Adam optimizer")
-    parser.add_argument("--placeholder_token", type=str, default=None)
+    parser.add_argument("--placeholder_token", type=str, default=None, help="placeholder token in dataset")
     parser.add_argument("--reward_tokens", type=str, nargs="*", default=None)
+    parser.add_argument("--specialize_reward_tokens", action="store_true", default=False)
+    parser.add_argument("--placeholder_token_in_tokenizer", type=str, default=None,
+                        help="placeholder_token in dataset will be repalced to reserved token in tokenizer when preprocessing.")
+    parser.add_argument("--reward_tokens_in_tokenizer", type=str, nargs="*", default=None,
+                        help="reward_tokens in dataset will be repalced to reserved tokens in tokenizer when preprocessing.")
 
     # packing samples using Flash Attention2
     parser.add_argument("--packing_samples", action="store_true", default=False)
@@ -201,4 +263,16 @@ if __name__ == "__main__":
             "and the second token should be the negative token."
         )
 
+    if args.placeholder_token_in_tokenizer is None:
+        args.placeholder_token_in_tokenizer = args.placeholder_token
+        print(
+            "Option '--placeholder_token_in_tokenizer' is None. "
+            f"placeholder_token_in_tokenizer is set to the placeholder token {repr(args.placeholder_token)} in dataset by default."
+        )
+    if args.reward_tokens_in_tokenizer is None:
+        args.reward_tokens_in_tokenizer = args.reward_tokens
+        print(
+            "Option '--reward_tokens_in_tokenizer' is None. "
+            f"reward_tokens_in_tokenizer is set to the reward tokens {repr(args.reward_tokens)} in dataset by default."
+        )
     train(args)
