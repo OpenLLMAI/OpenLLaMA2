@@ -499,6 +499,7 @@ class RemoteExperienceMaker(NaiveExperienceMaker):
         """
         Turn samples into experience by calculating logprobs, values, rewards, and kl divergence.
         """
+        args = self.strategy.args
         self.actor.eval()
         device = torch.cuda.current_device()
 
@@ -526,13 +527,13 @@ class RemoteExperienceMaker(NaiveExperienceMaker):
                 sequences_cpu, num_actions, attention_mask_cpu, packed_seq_lens=packed_seq_lens
             )
             # avoid CUDA OOM when colocate models
-            if self.strategy.args.colocate_critic_reward:
+            if args.colocate_critic_reward or args.colocate_all_models:
                 ray.get([value_ref])
                 ray.get([self.critic.empty_cache.remote()])
         else:
             value_ref = ray.put(None)
 
-        if self.strategy.args.colocate_actor_ref:
+        if args.colocate_actor_ref or args.colocate_all_models:
             ray.get([base_action_log_probs_ref])
             ray.get([self.initial_model.empty_cache.remote()])
 
@@ -576,17 +577,17 @@ class RemoteExperienceMaker(NaiveExperienceMaker):
         r = self.reward_fn(rewards) if len(rewards) > 0 else rewards[0]
 
         # avoid CUDA OOM when colocate models
-        if self.strategy.args.colocate_critic_reward and not self.remote_rm_url:
+        if args.colocate_critic_reward and not self.remote_rm_url:
             ray.get([self.reward_model[0].empty_cache.remote()])
 
-        if self.strategy.args.colocate_actor_ref:
+        if args.colocate_actor_ref or args.colocate_all_models:
             torch.cuda.empty_cache()
 
         kl = compute_approx_kl(
             action_log_probs,
             base_action_log_probs,
             action_mask=action_mask,
-            use_kl_estimator_k3=self.strategy.args.use_kl_estimator_k3,
+            use_kl_estimator_k3=args.use_kl_estimator_k3,
         )
 
         if not self.packing_samples:

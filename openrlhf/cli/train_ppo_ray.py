@@ -51,33 +51,21 @@ def train(args):
 
     # if colocated, create placement group for actor and ref model explicitly.
     pg = None
-    if args.colocate_actor_ref:
+    if args.colocate_actor_ref or args.colocate_all_models:
         assert (
             args.actor_num_nodes == args.ref_num_nodes and args.actor_num_gpus_per_node == args.ref_num_gpus_per_node
         ), f"num_nodes and num_gpus_per_node must be the same when colocate actor and ref model."
 
-        bundles = [
-            {"GPU": args.actor_num_gpus_per_node, "CPU": args.actor_num_gpus_per_node}
-            for _ in range(args.actor_num_nodes)
-        ]
-        pg = placement_group(bundles, strategy="STRICT_SPREAD")
+        bundles = [{"GPU": 1, "CPU": 1} for _ in range(args.actor_num_nodes * args.actor_num_gpus_per_node)]
+        pg = placement_group(bundles, strategy="PACK")
         ray.get(pg.ready())
 
-    # NOTE(wuxibin): Why don't we allocate 0.5 gpu for each actor when colocate models?
-    # Say we have 1 node with 4 GPUs, and num_gpus_per_node for each model is 4.
-    # If we allocate 0.5 gpu for both actor and ref model, then gpu allocation is
-    #   |actor|actor|actor|actor|  ref | ref  | ref  | ref |
-    #   |GPU0 |GPU0 |GPU1 |GPU1 | GPU2 | GPU2 | GPU3 | GPU3 |
-    #
-    # So 0.75/0.25 gpu is a tricky to let Ray spread all models evenly on all gpus.
-    #   |actor| ref  |actor| ref  |actor| ref  |actor|ref  |
-    #   |GPU0 | GPU0 |GPU1 | GPU1 |GPU2 | GPU2 |GPU3 | GPU3 |
     actor_model = PPORayActorGroup(
         args.actor_num_nodes,
         args.actor_num_gpus_per_node,
         ActorModelRayActor,
         pg=pg,
-        num_gpus_per_actor=0.75 if pg else 1,
+        num_gpus_per_actor=0.2 if pg else 1,
     )
 
     ref_model = PPORayActorGroup(
@@ -85,22 +73,18 @@ def train(args):
         args.ref_num_gpus_per_node,
         ReferenceModelRayActor,
         pg=pg,
-        num_gpus_per_actor=0.25 if pg else 1,
+        num_gpus_per_actor=0.2 if pg else 1,
     )
 
     # if colocated, create placement group for critic and reward model explicitly.
-    pg = None
-    if args.critic_pretrain and args.colocate_critic_reward:
+    if args.critic_pretrain and args.colocate_critic_reward and not args.colocate_all_models:
         assert (
             args.critic_num_nodes == args.reward_num_nodes
             and args.critic_num_gpus_per_node == args.reward_num_gpus_per_node
         ), f"num_nodes and num_gpus_per_node must be the same when colocate critic and reward model."
 
-        bundles = [
-            {"GPU": args.critic_num_gpus_per_node, "CPU": args.critic_num_gpus_per_node}
-            for _ in range(args.critic_num_nodes)
-        ]
-        pg = placement_group(bundles, strategy="STRICT_SPREAD")
+        bundles = [{"GPU": 1, "CPU": 1} for _ in range(args.critic_num_nodes * args.critic_num_gpus_per_node)]
+        pg = placement_group(bundles, strategy="PACK")
         ray.get(pg.ready())
 
     if args.critic_pretrain:
@@ -109,7 +93,7 @@ def train(args):
             args.critic_num_gpus_per_node,
             CriticModelRayActor,
             pg=pg,
-            num_gpus_per_actor=0.75 if pg else 1,
+            num_gpus_per_actor=0.2 if pg else 1,
         )
     else:
         critic_model = None
@@ -125,7 +109,7 @@ def train(args):
                     args.reward_num_gpus_per_node,
                     RewardModelRayActor,
                     pg=pg,
-                    num_gpus_per_actor=0.25 if pg else 1,
+                    num_gpus_per_actor=0.2 if pg else 1,
                 )
             )
     else:
@@ -151,6 +135,7 @@ def train(args):
             args.enable_prefix_caching,
             args.enforce_eager,
             max_len,
+            pg if args.colocate_all_models else None,
         )
 
     ray.get(refs)
@@ -200,6 +185,12 @@ if __name__ == "__main__":
         action="store_true",
         default=False,
         help="whether to colocate critic and reward model, if true, they will share same gpus.",
+    )
+    parser.add_argument(
+        "--colocate_all_models",
+        action="store_true",
+        default=False,
+        help="whether to colocate all models (including vLLM engines), if true, they will share same gpus.",
     )
 
     # optional vLLM for text generation
